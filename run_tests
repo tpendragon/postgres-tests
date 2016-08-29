@@ -1,0 +1,86 @@
+#!/usr/bin/env ruby
+
+require 'pg'
+require 'pry'
+require 'benchmark'
+require 'json'
+
+conn = PG.connect(dbname: 'postgres')
+def context
+  {
+    "dc" => "http://purl.org/dc/terms/",
+    "pcdm" => "http://pcdm.org/models#"
+  }
+end
+
+def collection_node
+  {
+    "@context": context,
+    "@type": ["pcdm:Collection"]
+  }
+end
+
+def object_node
+  {
+    "@context": context,
+    "@type": ["pcdm:Object"]
+  }
+end
+conn.exec("DROP TABLE resources")
+conn.exec("CREATE TABLE resources (
+            id serial primary key,
+            has_member integer[],
+            title varchar(20),
+            metadata jsonb
+          )")
+conn.exec('CREATE INDEX idx_has_member on "resources" USING GIN ("has_member");')
+conn.exec('CREATE INDEX idx_metadata on "resources" USING GIN ("metadata");')
+conn.exec("CREATE INDEX type_idx ON resources USING gin ((metadata->'@type') jsonb_path_ops);")
+collections_to_create = 50
+time_to_create_collections = Benchmark.measure do
+  collections_to_create.times do |collection|
+    result = conn.exec("INSERT INTO resources(title, metadata) VALUES(\'Test\', \'#{collection_node.to_json}\')")
+  end
+end
+objects_to_create = 100000
+time_to_create_objects = Benchmark.measure do
+  objects_to_create.times do |num|
+    conn.exec("INSERT INTO resources(title, metadata) VALUES(\'Object #{num}\', \'#{object_node.to_json}\')")
+  end
+end
+
+object_ids = conn.exec("SELECT id FROM resources WHERE metadata->'@type' @> '[\"pcdm:Object\"]'").to_a.map{|x| x["id"]}
+collection_ids = conn.exec("SELECT id FROM resources WHERE metadata->'@type' @> '[\"pcdm:Collection\"]'").to_a.map{|x| x["id"]}
+
+time_to_associate = Benchmark.measure do
+  collection_ids.each do |id|
+    conn.exec("UPDATE resources SET has_member = ARRAY[#{object_ids.sample(10000).join(", ")}] WHERE id = #{id}")
+  end
+end
+
+time_to_get_collection = Benchmark.measure do
+  conn.exec("SELECT * FROM resources WHERE id = #{collection_ids.first}")
+end
+
+time_to_update_collection_title = Benchmark.measure do
+  conn.exec("UPDATE resources SET title = 'Testing' WHERE id = #{collection_ids.first}")
+end
+
+discovered_count = 0
+time_to_query_members = Benchmark.measure do
+  result = conn.exec("SELECT * FROM resources WHERE has_member @> ARRAY[#{object_ids.first}]")
+  discovered_count = result.to_a.length
+end
+
+puts "Time to create #{collections_to_create} collections:"
+puts time_to_create_collections
+puts "Time to create #{objects_to_create} objects:"
+puts time_to_create_objects
+puts "Time to associate objects:"
+puts time_to_associate
+puts "Time to get collection:"
+puts time_to_get_collection
+puts "Time to update collection title:"
+puts time_to_update_collection_title
+puts "Time to discover that the first object has #{discovered_count} collections:"
+puts time_to_query_members
